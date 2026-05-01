@@ -1,7 +1,7 @@
 """QuickSTT Phase 3: 글로벌 단축키로 녹음 시작/종료.
 
 실행 후 백그라운드에서 대기하다가 `Cmd+Shift+R`을 누르면 녹음을 시작하고,
-다시 누르면 녹음을 종료한 뒤 faster-whisper로 한국어 변환을 수행한다.
+다시 누르면 녹음을 종료한 뒤 Whisper 엔진으로 한국어 변환을 수행한다.
 
 사용 예:
     python main.py
@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
+import platform
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -26,6 +29,15 @@ from recorder import Recorder
 from session import LongRecordingSession
 from transcriber import Transcriber
 
+SOUNDS = {
+    "start": "/System/Library/Sounds/Glass.aiff",
+    "stop": "/System/Library/Sounds/Pop.aiff",
+    "complete": "/System/Library/Sounds/Blow.aiff",
+    "error": "/System/Library/Sounds/Basso.aiff",
+}
+
+LOCK_PATH = Path("~/QuickSTT/quickstt.lock").expanduser()
+
 
 def audio_levels(audio: np.ndarray) -> tuple[float, float]:
     """int16 PCM에서 peak(0~1), RMS(0~1) 정규화 값을 계산."""
@@ -35,6 +47,117 @@ def audio_levels(audio: np.ndarray) -> tuple[float, float]:
     peak = float(np.max(np.abs(a)))
     rms = float(np.sqrt(np.mean(a * a)))
     return peak, rms
+
+
+def copy_to_clipboard(text: str, *, enabled: bool = True) -> bool:
+    """텍스트를 클립보드에 복사하고 성공 여부를 반환."""
+    if not enabled or not text:
+        return False
+    try:
+        import pyperclip
+
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        pass
+    try:
+        completed = subprocess.run(
+            ["pbcopy"],
+            input=text,
+            text=True,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if completed.returncode != 0:
+            print("클립보드 복사 실패: pbcopy 실행 실패", flush=True)
+            return False
+    except Exception as exc:
+        print(f"클립보드 복사 실패: {exc}", flush=True)
+        return False
+    return True
+
+
+def notify(title: str, message: str, *, enabled: bool = True) -> bool:
+    """macOS 알림을 보내고 성공 여부를 반환."""
+    if not enabled:
+        return False
+    script = f'display notification "{_escape_applescript(message)}" with title "{_escape_applescript(title)}"'
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
+def play_sound(kind: str, *, enabled: bool = True) -> bool:
+    """macOS 시스템 사운드를 재생하고 성공 여부를 반환."""
+    if not enabled:
+        return False
+    sound_path = SOUNDS.get(kind)
+    if sound_path is None:
+        return False
+    try:
+        completed = subprocess.run(
+            ["afplay", sound_path],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
+def _escape_applescript(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def acquire_single_instance_lock(lock_path: Path = LOCK_PATH):
+    """중복 실행을 막기 위한 프로세스 락을 획득한다."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
+def check_hotkey_trust() -> bool:
+    """macOS에서 전역 핫키 입력 감시 권한이 있는지 확인."""
+    if platform.system() != "Darwin":
+        return True
+    try:
+        import HIServices
+    except Exception:
+        return True
+    return bool(HIServices.AXIsProcessTrusted())
+
+
+def print_hotkey_permission_warning() -> None:
+    print("전역 핫키 권한이 없습니다.", flush=True)
+    print(
+        "macOS 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 "
+        "현재 터미널 앱을 허용하세요.",
+        flush=True,
+    )
+    print(
+        "필요하면 개인정보 보호 및 보안 > 입력 모니터링에도 현재 터미널 앱을 추가하세요.",
+        flush=True,
+    )
+    print(
+        "conda run으로 실행할 때 출력이 안 보이면 --no-capture-output을 붙이세요.",
+        flush=True,
+    )
 
 
 class QuickSTTApp:
@@ -52,6 +175,9 @@ class QuickSTTApp:
         hotkey_debounce_ms: int = 1000,
         output_dir: str | Path = "~/QuickSTT/recordings",
         chunk_seconds: int = 300,
+        clipboard_enabled: bool = True,
+        notify_enabled: bool = True,
+        sound_enabled: bool = True,
     ) -> None:
         self.transcriber = transcriber
         self.mode = mode
@@ -62,6 +188,9 @@ class QuickSTTApp:
         self.hotkey_debounce_sec = hotkey_debounce_ms / 1000
         self.output_dir = Path(output_dir).expanduser()
         self.chunk_seconds = chunk_seconds
+        self.clipboard_enabled = clipboard_enabled
+        self.notify_enabled = notify_enabled
+        self.sound_enabled = sound_enabled
         self._lock = threading.Lock()
         self._state = "idle"
         self._recording_started_at = 0.0
@@ -118,6 +247,8 @@ class QuickSTTApp:
             print("진행 중인 장시간 세션을 마감합니다.", flush=True)
             session.stop(wait=True)
             print(f"transcript: {session.transcript_path}", flush=True)
+            self._copy_transcript(session.transcript_path)
+            self._feedback("QuickSTT", "장시간 세션을 종료했습니다.", "complete")
             return
 
         try:
@@ -139,6 +270,7 @@ class QuickSTTApp:
             session.start()
         except Exception as exc:
             print(f"장시간 세션 시작 실패: {exc}", flush=True)
+            self._feedback("QuickSTT 오류", f"장시간 세션 시작 실패: {exc}", "error")
             self._state = "idle"
             return
 
@@ -150,6 +282,7 @@ class QuickSTTApp:
         )
         print(f"session_dir: {session.session_dir}", flush=True)
         print("다시 단축키를 누르면 세션을 종료합니다.", flush=True)
+        self._feedback("QuickSTT", "장시간 녹음을 시작했습니다.", "start")
 
     def _stop_session(self) -> None:
         session = self._session
@@ -165,8 +298,11 @@ class QuickSTTApp:
                 f"transcript={session.transcript_path}",
                 flush=True,
             )
+            self._copy_transcript(session.transcript_path)
+            self._feedback("QuickSTT", "장시간 세션 변환을 완료했습니다.", "complete")
         except Exception as exc:
             print(f"세션 종료 실패: {exc}", flush=True)
+            self._feedback("QuickSTT 오류", f"세션 종료 실패: {exc}", "error")
         finally:
             with self._lock:
                 self._session = None
@@ -177,12 +313,14 @@ class QuickSTTApp:
             self.recorder.start()
         except Exception as exc:
             print(f"녹음 시작 실패: {exc}", flush=True)
+            self._feedback("QuickSTT 오류", f"녹음 시작 실패: {exc}", "error")
             self._state = "idle"
             return
 
         self._recording_started_at = time.perf_counter()
         self._state = "recording"
         print("녹음 시작. 다시 단축키를 누르면 종료합니다.", flush=True)
+        self._feedback("QuickSTT", "녹음을 시작했습니다.", "start")
 
     def _stop_and_transcribe(self) -> None:
         wav_path: Path | None = None
@@ -191,8 +329,10 @@ class QuickSTTApp:
             duration = time.perf_counter() - self._recording_started_at
             if audio.size == 0:
                 print("녹음된 오디오가 없습니다.", flush=True)
+                self._feedback("QuickSTT", "녹음된 오디오가 없습니다.", "error")
                 return
 
+            play_sound("stop", enabled=self.sound_enabled)
             peak, rms = audio_levels(audio)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 wav_path = Path(f.name)
@@ -206,11 +346,16 @@ class QuickSTTApp:
             if peak < 0.01:
                 print("입력 신호가 거의 없습니다. 마이크 권한/입력 디바이스를 확인하세요.", flush=True)
 
+            if self.transcriber.supports_vad:
+                vad_status = (
+                    f"vad_filter=True, min_silence={self.vad_min_silence_ms}ms"
+                    if self.vad_filter
+                    else "vad_filter=False"
+                )
+            else:
+                vad_status = "vad_filter=unsupported"
             print(
-                "변환 중... (vad_filter={}, min_silence={}ms)".format(
-                    self.vad_filter,
-                    self.vad_min_silence_ms if self.vad_filter else "off",
-                ),
+                f"변환 중... (engine={self.transcriber.active_engine}, {vad_status})",
                 flush=True,
             )
             started_at = time.perf_counter()
@@ -225,19 +370,40 @@ class QuickSTTApp:
                 f"detected={info.language} p={info.language_probability:.2f})",
                 flush=True,
             )
+            if copy_to_clipboard(text, enabled=self.clipboard_enabled):
+                print("클립보드에 복사했습니다.", flush=True)
             print()
             print("--- 변환 결과 ---")
             print(text if text else "(빈 결과)")
             print("------------------")
             print()
+            self._feedback(
+                "QuickSTT",
+                "변환을 완료했습니다." if text else "변환 결과가 비어 있습니다.",
+                "complete" if text else "error",
+            )
             print("대기 중... 단축키로 다시 녹음할 수 있습니다.", flush=True)
         except Exception as exc:
             print(f"변환 처리 실패: {exc}", flush=True)
+            self._feedback("QuickSTT 오류", f"변환 처리 실패: {exc}", "error")
         finally:
             if wav_path is not None and not self.keep_wav:
                 wav_path.unlink(missing_ok=True)
             with self._lock:
                 self._state = "idle"
+
+    def _copy_transcript(self, transcript_path: Path) -> None:
+        try:
+            text = transcript_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            print(f"transcript 읽기 실패: {exc}", flush=True)
+            return
+        if copy_to_clipboard(text, enabled=self.clipboard_enabled):
+            print("transcript 전체를 클립보드에 복사했습니다.", flush=True)
+
+    def _feedback(self, title: str, message: str, sound_kind: str) -> None:
+        notify(title, message, enabled=self.notify_enabled)
+        play_sound(sound_kind, enabled=self.sound_enabled)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -246,7 +412,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default="small",
         choices=["tiny", "base", "small", "medium", "large-v3"],
-        help="faster-whisper 모델 크기 (기본 small)",
+        help="Whisper 모델 크기 (기본 small)",
+    )
+    parser.add_argument(
+        "--engine",
+        default="auto",
+        choices=["auto", "faster-whisper", "mlx-whisper"],
+        help="변환 엔진: auto=Apple Silicon에서 mlx-whisper 우선 (기본 auto)",
+    )
+    parser.add_argument(
+        "--mlx-model",
+        default=None,
+        help="mlx-whisper 모델 repo 또는 로컬 경로 (기본 모델 크기 기반 자동 선택)",
     )
     parser.add_argument(
         "--mode",
@@ -292,17 +469,60 @@ def build_parser() -> argparse.ArgumentParser:
         default="~/QuickSTT/recordings",
         help="session 모드 출력 루트 디렉터리 (기본 ~/QuickSTT/recordings)",
     )
+    parser.add_argument(
+        "--no-clipboard",
+        action="store_true",
+        help="변환 결과를 클립보드에 복사하지 않음",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="macOS 알림을 보내지 않음",
+    )
+    parser.add_argument(
+        "--no-sound",
+        action="store_true",
+        help="macOS 시스템 사운드를 재생하지 않음",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    lock_file = acquire_single_instance_lock()
+    if lock_file is None:
+        print("QuickSTT가 이미 실행 중입니다.", flush=True)
+        print("기존 프로세스를 종료한 뒤 다시 실행하세요.", flush=True)
+        return 1
 
-    print(f"모델 로드 중: {args.model} (ko)")
+    try:
+        return run_app(args)
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def run_app(args: argparse.Namespace) -> int:
+    print(f"모델 로드 중: {args.model} (ko, engine={args.engine})", flush=True)
     started_at = time.perf_counter()
-    transcriber = Transcriber(model_size=args.model, language="ko")
+    transcriber = Transcriber(
+        model_size=args.model,
+        language="ko",
+        engine=args.engine,
+        mlx_model=args.mlx_model,
+    )
     transcriber.load()
-    print(f"준비 완료 ({time.perf_counter() - started_at:.1f}s)")
+    print(
+        f"엔진 준비 완료 ({time.perf_counter() - started_at:.1f}s, "
+        f"active_engine={transcriber.active_engine})",
+        flush=True,
+    )
+    if transcriber.active_engine == "mlx-whisper":
+        model_name = args.mlx_model or args.model
+        print(
+            f"MLX 모델({model_name})은 첫 변환 시 다운로드/로드될 수 있습니다.",
+            flush=True,
+        )
 
     app = QuickSTTApp(
         transcriber=transcriber,
@@ -314,6 +534,9 @@ def main() -> int:
         hotkey_debounce_ms=args.hotkey_debounce_ms,
         output_dir=args.output_dir,
         chunk_seconds=args.chunk_seconds,
+        clipboard_enabled=(not args.no_clipboard),
+        notify_enabled=(not args.no_notify),
+        sound_enabled=(not args.no_sound),
     )
 
     stop_event = threading.Event()
@@ -324,18 +547,32 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
+    hotkey_trusted = check_hotkey_trust()
+    if not hotkey_trusted:
+        print_hotkey_permission_warning()
+        return 1
+
     print(f"대기 중... 단축키: {args.hotkey}")
     print(f"모드: {args.mode}")
     if args.mode == "session":
         print(f"청크 길이: {args.chunk_seconds}s, 출력 폴더: {Path(args.output_dir).expanduser()}")
+    print(
+        "클립보드={}, 알림={}, 사운드={}".format(
+            "off" if args.no_clipboard else "on",
+            "off" if args.no_notify else "on",
+            "off" if args.no_sound else "on",
+        )
+    )
     print("종료하려면 Ctrl+C")
     print()
 
     listener = keyboard.GlobalHotKeys({args.hotkey: app.toggle_recording})
     listener.daemon = True
+    listener_started = False
 
     try:
         listener.start()
+        listener_started = True
         while not stop_event.is_set():
             time.sleep(0.1)
     except Exception as exc:
@@ -344,13 +581,13 @@ def main() -> int:
         return 1
     finally:
         app.shutdown()
-        listener.stop()
-        listener.join(timeout=1.0)
+        if listener_started:
+            listener.stop()
+            listener.join(timeout=1.0)
 
     print("종료합니다.")
     return 0
 
 
 if __name__ == "__main__":
-    exit_code = main()
-    os._exit(exit_code)
+    sys.exit(main())

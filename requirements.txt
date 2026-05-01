@@ -1,11 +1,14 @@
 # 의존성
 # - faster-whisper: 음성 인식 엔진 (ctranslate2, tokenizers, onnxruntime, huggingface_hub,
 #                   av(PyAV), numpy 등을 전이 의존성으로 함께 설치)
+# - mlx-whisper   : Apple Silicon MLX 기반 음성 인식 엔진
 # - sounddevice  : 마이크 입력 (Phase 2~)
 # - pynput       : 글로벌 단축키 (Phase 3~)
+# - pyperclip    : 변환 결과 클립보드 복사
 # wav 저장/읽기는 표준 라이브러리 `wave` 사용으로 scipy 의존성을 회피.
-# Phase 4 이후 pyperclip, PyYAML, plyer 추가 예정.
 faster-whisper>=1.1.0
+mlx-whisper>=0.4.3
 sounddevice>=0.4.6
 numpy>=1.24
 pynput>=1.7.6
+pyperclip>=1.8
